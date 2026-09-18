@@ -9,11 +9,14 @@ not from a Python lock.
 from __future__ import annotations
 
 import os
+import tempfile
+from pathlib import Path
 
 # Default to a scratch DB so `pytest` never resets the dev server's
 # `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
 # (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+_test_db_path = (Path(tempfile.gettempdir()) / "agent-relay-test.db").as_posix()
+os.environ.setdefault("RELAY_DATABASE_URL", f"sqlite:///{_test_db_path}")
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta

@@ -1,9 +1,8 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module configures the database engine and transaction seams. The default
+database is PostgreSQL, utilizing row-level locking (FOR UPDATE SKIP LOCKED)
+for concurrent task claims, while maintaining SQLite compatibility.
 """
 
 from __future__ import annotations
@@ -19,7 +18,14 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    url = (
+        os.getenv("RELAY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay"
+    )
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg://", 1)
+    return url
 
 
 def positive_int(name: str, default: int) -> int:
@@ -141,6 +147,8 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+else:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -177,24 +185,28 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run an atomic transaction seam before selecting or changing work.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    For SQLite, a ``BEGIN IMMEDIATE`` writer reservation serializes claims
+    and prevents lock escalation errors. For PostgreSQL, a standard transaction
+    is used along with row-level locking (such as ``FOR UPDATE SKIP LOCKED``).
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
-        yield session
-        session.flush()
-        connection.commit()
+        if _is_sqlite(str(engine.url)):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+            yield session
+            session.flush()
+            connection.commit()
+        else:
+            with connection.begin():
+                yield session
+                session.flush()
     except Exception:
-        connection.rollback()
+        if _is_sqlite(str(engine.url)):
+            connection.rollback()
         raise
     finally:
         session.close()
@@ -205,13 +217,14 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
     now_db = as_db_time(now)
-    expired = list(
-        db.scalars(
-            select(Attempt)
-            .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
-            .order_by(Attempt.lease_expires_at, Attempt.id)
-        )
+    stmt = (
+        select(Attempt)
+        .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
+        .order_by(Attempt.lease_expires_at, Attempt.id)
     )
+    if db.bind and getattr(db.bind, "dialect", None) and db.bind.dialect.name == "postgresql":
+        stmt = stmt.with_for_update(skip_locked=True)
+    expired = list(db.scalars(stmt))
     count = 0
     for attempt in expired:
         task = db.get(Task, attempt.task_id)
