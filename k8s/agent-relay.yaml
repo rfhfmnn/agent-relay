@@ -1,0 +1,67 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: agent-relay
+  labels:
+    app: agent-relay
+    app.kubernetes.io/name: agent-relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: agent-relay
+  template:
+    metadata:
+      labels:
+        app: agent-relay
+        app.kubernetes.io/name: agent-relay
+    spec:
+      containers:
+        - name: agent-relay
+          image: agent-relay:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+              name: http
+          env:
+            - name: DATABASE_URL
+              value: postgresql+psycopg://postgres:postgres@postgres:5432/agent_relay
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8000
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: agent-relay
+  labels:
+    app: agent-relay
+    app.kubernetes.io/name: agent-relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  type: ClusterIP
+  selector:
+    app: agent-relay
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

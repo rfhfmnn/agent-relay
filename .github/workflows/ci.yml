@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  test-and-deploy:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agent_relay
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          if ! command -v uv &> /dev/null; then
+            curl -LsSf https://astral.sh/uv/install.sh | sh
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+            echo "$HOME/.cargo/bin" >> $GITHUB_PATH
+          fi
+
+      - name: Set up Python
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv python install 3.11
+
+      - name: Install dependencies
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          uv sync --frozen
+
+      - name: Run tests against PostgreSQL
+        run: |
+          export PATH="$HOME/.local/bin:$HOME/.cargo/bin:$PATH"
+          for i in $(seq 1 30); do
+            if python3 -c "import socket; s = socket.socket(); s.connect(('postgres', 5432))" 2>/dev/null; then
+              echo "PostgreSQL is reachable at postgres:5432"
+              export RELAY_DATABASE_URL="postgresql+psycopg://postgres:postgres@postgres:5432/agent_relay"
+              break
+            elif python3 -c "import socket; s = socket.socket(); s.connect(('localhost', 5432))" 2>/dev/null; then
+              echo "PostgreSQL is reachable at localhost:5432"
+              export RELAY_DATABASE_URL="postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay"
+              break
+            fi
+            echo "Waiting for PostgreSQL ($i/30)..."
+            sleep 1
+          done
+          echo "Using RELAY_DATABASE_URL: $RELAY_DATABASE_URL"
+          uv run pytest -v
+
+      - name: Generate unique image tag
+        id: vars
+        run: |
+          TAG="v-${{ github.run_number }}-$(date +%s)"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Generated unique image tag: ${TAG}"
+
+      - name: Build Docker image
+        run: |
+          docker build -t agent-relay:${{ steps.vars.outputs.tag }} .
+
+      - name: Setup kind and kubectl
+        run: |
+          if ! command -v kind &> /dev/null; then
+            echo "Installing kind..."
+            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+            chmod +x /usr/local/bin/kind
+          fi
+          if ! command -v kubectl &> /dev/null; then
+            echo "Installing kubectl..."
+            curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+            chmod +x kubectl
+            mv kubectl /usr/local/bin/kubectl
+          fi
+          kind version
+          kubectl version --client
+
+      - name: Connect to kind network
+        run: |
+          docker network connect kind $(hostname) 2>/dev/null || true
+
+      - name: Load Docker image into kind
+        run: |
+          kind load docker-image agent-relay:${{ steps.vars.outputs.tag }} --name kind
+
+      - name: Deploy to kind cluster
+        run: |
+          mkdir -p "$HOME/.kube"
+          kind get kubeconfig --internal --name kind > "$HOME/.kube/config"
+          KIND_IP=$(docker inspect kind-control-plane --format '{{.NetworkSettings.Networks.kind.IPAddress}}' 2>/dev/null || true)
+          if [ -n "$KIND_IP" ]; then
+            sed -i "s|https://kind-control-plane:6443|https://${KIND_IP}:6443|g" "$HOME/.kube/config"
+          fi
+          sed -i "s|image: agent-relay:.*|image: agent-relay:${{ steps.vars.outputs.tag }}|g" k8s/agent-relay.yaml
+          kubectl apply -f k8s/agent-relay.yaml
+          kubectl rollout status deployment/agent-relay --timeout=90s
+          kubectl get pods -l app=agent-relay -o wide
