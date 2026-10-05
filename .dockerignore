@@ -1,0 +1,14 @@
+.venv
+.git
+.gitignore
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+*.db
+*.db-shm
+*.db-wal
+*-credentials.json
+.ruff_cache
+*.pdf
