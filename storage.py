@@ -148,6 +148,7 @@ def claim_one(agent_id: str, worker_id: str | None) -> dict[str, Any] | None:
             select(Task)
             .where(Task.recipient_id == agent_id, Task.status == "queued")
             .order_by(Task.created_at, Task.id)
+            .with_for_update(skip_locked=True)
             .limit(1)
         )
         if task is None:

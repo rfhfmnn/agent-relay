@@ -1,14 +1,13 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+Supports PostgreSQL via psycopg with connection pooling and row locking,
+while retaining SQLite compatibility for local testing.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
@@ -19,7 +18,16 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 
 
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    url = (
+        os.getenv("RELAY_DATABASE_URL")
+        or os.getenv("DATABASE_URL")
+        or "postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay"
+    )
+    if url.startswith("postgresql://"):
+        url = "postgresql+psycopg://" + url[len("postgresql://"):]
+    elif url.startswith("postgres://"):
+        url = "postgresql+psycopg://" + url[len("postgres://"):]
+    return url
 
 
 def positive_int(name: str, default: int) -> int:
@@ -141,6 +149,8 @@ if _is_sqlite(DATABASE_URL):
         from sqlalchemy.pool import StaticPool
 
         engine_kwargs["poolclass"] = StaticPool
+else:
+    engine_kwargs.update({"pool_size": 10, "max_overflow": 20})
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
@@ -158,8 +168,15 @@ if _is_sqlite(DATABASE_URL):
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def init_db(max_retries: int = 5, retry_interval: float = 1.0) -> None:
+    for attempt in range(max_retries):
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except Exception:
+            if attempt == max_retries - 1:
+                raise
+            time.sleep(retry_interval)
 
 
 @contextmanager
@@ -177,24 +194,26 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Execute a transactional block with serialization or row locking.
 
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    On SQLite, this uses a ``BEGIN IMMEDIATE`` writer reservation to serialize
+    claims. On PostgreSQL, row locking via ``FOR UPDATE SKIP LOCKED`` coordinates
+    concurrent workers, and this context manager provides standard transaction
+    lifecycle (commit/rollback).
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if _is_sqlite(DATABASE_URL):
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
         yield session
         session.flush()
-        connection.commit()
+        if connection.in_transaction():
+            connection.commit()
     except Exception:
-        connection.rollback()
+        if connection.in_transaction():
+            connection.rollback()
         raise
     finally:
         session.close()

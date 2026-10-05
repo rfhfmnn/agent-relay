@@ -1,0 +1,88 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-test-deploy:
+    name: Test, Build and Deploy to kind
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agent_relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+
+      - name: Run starter and integration tests against PostgreSQL
+        env:
+          RELAY_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay
+          DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/agent_relay
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          uv run pytest -v
+
+      - name: Generate unique image tag
+        id: vars
+        run: |
+          TAG="v-$(date +%s)-${GITHUB_SHA::7}"
+          echo "IMAGE_TAG=${TAG}" >> $GITHUB_ENV
+          echo "tag=${TAG}" >> $GITHUB_OUTPUT
+          echo "Using unique image tag: ${TAG}"
+
+      - name: Build Docker image
+        run: |
+          docker build -t "agent-relay:${IMAGE_TAG}" .
+
+      - name: Configure kind CLI and load image into kind
+        run: |
+          if ! command -v kind >/dev/null 2>&1; then
+            echo "Installing kind CLI..."
+            curl -Lo /usr/local/bin/kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+            chmod +x /usr/local/bin/kind
+          fi
+          echo "Loading agent-relay:${IMAGE_TAG} into cluster agent-relay-cluster..."
+          kind load docker-image "agent-relay:${IMAGE_TAG}" --name agent-relay-cluster
+
+      - name: Deploy to kind cluster and wait for rollout
+        run: |
+          echo "Applying Kubernetes manifests..."
+          docker exec -i agent-relay-cluster-control-plane kubectl apply -f - < k8s/deployment.yaml
+
+          echo "Updating deployment image to agent-relay:${IMAGE_TAG}..."
+          docker exec agent-relay-cluster-control-plane kubectl set image deployment/agent-relay agent-relay="agent-relay:${IMAGE_TAG}"
+
+          echo "Waiting for deployment rollout to finish..."
+          docker exec agent-relay-cluster-control-plane kubectl rollout status deployment/agent-relay --timeout=90s
+
+      - name: Verify deployed dashboard
+        run: |
+          echo "Checking deployed dashboard heading..."
+          docker exec agent-relay-cluster-control-plane kubectl exec deployment/agent-relay -- python -c "
+          import urllib.request
+          html = urllib.request.urlopen('http://localhost:8000/').read().decode()
+          heading = [line.strip() for line in html.splitlines() if '<h1' in line]
+          print('Found heading:', heading)
+          assert len(heading) > 0, 'No <h1> found in dashboard'
+          "
